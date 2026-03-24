@@ -1,32 +1,38 @@
 {
   "name": "@0xkobold/pi-gateway",
-  "version": "0.1.0",
-  "description": "HTTP/WebSocket gateway for pi agent - expose pi to external clients",
-  "keywords": ["pi-package"],
+  "version": "0.2.0",
+  "description": "Hermes-style messaging gateway for pi-coding-agent",
+  "keywords": ["pi-package", "gateway", "messaging", "hermes"],
   "type": "module",
+  "main": "./dist/index.ts",
+  "exports": {
+    ".": { "import": "./dist/index.ts" },
+    "./sessions": { "import": "./dist/sessions/store.ts" },
+    "./security": { "import": "./dist/security/auth.ts" },
+    "./adapters": { "import": "./dist/adapters/discord.ts" }
+  },
   "scripts": {
-    "test": "npx tsx tests/index.ts",
-    "demo": "npx tsx tests/demo-server.ts",
-    "client": "npx tsx tests/client-demo.ts"
+    "build": "echo 'Using bun' && exit 0",
+    "test": "bun test"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "zod": "^3.25.0"
   },
   "devDependencies": {
     "@types/node": "^20.19.37",
     "@types/ws": "^8.18.1",
-    "typescript": "^6.0.2"
+    "@types/bun": "^1.2.0",
+    "bun-types": "^1.2.0"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
     "@sinclair/typebox": "*"
   },
   "pi": {
-    "extensions": [
-      "./index.ts"
-    ],
-    "skills": [
-      "./skills"
-    ]
-  }
+    "extensions": ["./dist/index.ts"]
+  },
+  "repository": { "type": "git", "url": "https://github.com/0xKobold/pi-gateway.git" },
+  "author": "0xKobold",
+  "license": "MIT"
 }
