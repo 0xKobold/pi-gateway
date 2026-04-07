@@ -12,16 +12,41 @@ import { Database } from "bun:sqlite";
 import { join } from "path";
 import { homedir } from "os";
 import { existsSync, mkdirSync } from "fs";
-import type { Session, ChatMessage, Platform, ResetPolicy } from "../types.js";
+
+export type ResetPolicy = "daily" | "idle" | "both";
+
+export interface SessionConfig {
+  id: string;
+  platform: string;
+  channelId: string;
+  userId: string;
+  resetPolicy: ResetPolicy;
+  dailyHour: number;        // Hour (0-23) for daily reset
+  idleMinutes: number;      // Minutes for idle reset
+  lastActivity: number;     // Timestamp of last activity
+  createdAt: number;
+  isBackground: boolean;
+  parentSessionId?: string;  // For background task tracking
+}
+
+interface SessionRow {
+  id: string;
+  platform: string;
+  channel_id: string;
+  user_id: string;
+  reset_policy: string;
+  daily_hour: number;
+  idle_minutes: number;
+  last_activity: number;
+  created_at: number;
+  is_background: number;
+  parent_session_id: string | null;
+}
 
 const KOBOLD_DIR = join(homedir(), ".0xkobold");
-const GATEWAY_DIR = join(KOBOLD_DIR, "gateway");
-const SESSIONS_DB = join(GATEWAY_DIR, "sessions.db");
+const SESSIONS_DB = join(KOBOLD_DIR, "gateway-sessions.db");
 
 let db: Database | null = null;
-
-// In-memory session cache
-const sessionCache = new Map<string, Session>();
 
 /**
  * Initialize session database
@@ -29,8 +54,8 @@ const sessionCache = new Map<string, Session>();
 export function initSessionStore(): Database {
   if (db) return db;
 
-  if (!existsSync(GATEWAY_DIR)) {
-    mkdirSync(GATEWAY_DIR, { recursive: true });
+  if (!existsSync(KOBOLD_DIR)) {
+    mkdirSync(KOBOLD_DIR, { recursive: true });
   }
 
   db = new Database(SESSIONS_DB);
@@ -50,26 +75,14 @@ export function initSessionStore(): Database {
       created_at INTEGER NOT NULL,
       is_background INTEGER NOT NULL DEFAULT 0,
       parent_session_id TEXT,
-      title TEXT,
       FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
     )
   `);
 
-  // Messages table
-  db.run(`
-    CREATE TABLE IF NOT EXISTS messages (
-      id TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL,
-      role TEXT NOT NULL,
-      content TEXT NOT NULL,
-      timestamp INTEGER NOT NULL,
-      FOREIGN KEY (session_id) REFERENCES sessions(id)
-    )
-  `);
-
-  // Indexes
+  // Indexes for fast lookups
   db.run(`CREATE INDEX IF NOT EXISTS idx_sessions_platform_channel ON sessions(platform, channel_id)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_sessions_activity ON sessions(last_activity)`);
 
   console.log("[SessionStore] Database initialized");
   return db;
@@ -83,64 +96,44 @@ export function generateSessionId(): string {
 }
 
 /**
- * Get session key (platform:channelId)
- */
-export function getSessionKey(platform: Platform, channelId: string): string {
-  return `${platform}:${channelId}`;
-}
-
-/**
  * Get or create session for a platform/channel
  */
 export function getOrCreateSession(
-  platform: Platform,
+  platform: string,
   channelId: string,
   userId: string,
-  config?: {
-    resetPolicy?: ResetPolicy;
-    dailyHour?: number;
-    idleMinutes?: number;
-  }
-): Session {
-  const key = getSessionKey(platform, channelId);
-  
-  // Check in-memory cache first
-  const cached = sessionCache.get(key);
-  if (cached) {
-    // Check if session needs reset
-    if (shouldResetSession(cached)) {
-      sessionCache.delete(key);
-      db?.run("DELETE FROM sessions WHERE id = ?", [cached.id]);
-    } else {
-      // Update last activity
-      cached.lastActivity = Date.now();
-      touchSession(cached.id);
-      return cached;
-    }
-  }
-
-  // Check database
+  config?: Partial<SessionConfig>
+): SessionConfig {
   const database = initSessionStore();
-  const row = database.query(`
+
+  // Try to find existing active session
+  const existing = database.query(`
     SELECT * FROM sessions 
     WHERE platform = ? AND channel_id = ? AND is_background = 0
     ORDER BY last_activity DESC
     LIMIT 1
-  `).get(platform, channelId) as any;
+  `).get(platform, channelId) as SessionRow | undefined;
 
-  if (row && !shouldResetSession(row)) {
-    const session = rowToSession(row);
-    session.messages = loadMessages(session.id);
-    sessionCache.set(key, session);
-    touchSession(session.id);
-    return session;
+  if (existing) {
+    // Check if session needs reset
+    if (shouldResetSession(existing)) {
+      // Delete old session, create fresh one
+      database.run("DELETE FROM sessions WHERE id = ?", [existing.id]);
+    } else {
+      // Update last activity and return
+      database.run(
+        "UPDATE sessions SET last_activity = ? WHERE id = ?",
+        [Date.now(), existing.id]
+      );
+      return rowToSession(existing);
+    }
   }
 
   // Create new session
   const id = generateSessionId();
   const now = Date.now();
   
-  const session: Session = {
+  const session: SessionConfig = {
     id,
     platform,
     channelId,
@@ -151,33 +144,45 @@ export function getOrCreateSession(
     lastActivity: now,
     createdAt: now,
     isBackground: false,
-    messages: [],
+    ...config,
   };
 
   database.run(`
-    INSERT INTO sessions (id, platform, channel_id, user_id, reset_policy, daily_hour, idle_minutes, last_activity, created_at, is_background)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-  `, [id, platform, channelId, userId, session.resetPolicy, session.dailyHour, session.idleMinutes, now, now]);
+    INSERT INTO sessions (id, platform, channel_id, user_id, reset_policy, daily_hour, idle_minutes, last_activity, created_at, is_background, parent_session_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `, [
+    session.id,
+    session.platform,
+    session.channelId,
+    session.userId,
+    session.resetPolicy,
+    session.dailyHour,
+    session.idleMinutes,
+    session.lastActivity,
+    session.createdAt,
+    session.isBackground ? 1 : 0,
+    session.parentSessionId ?? null,
+  ]);
 
-  sessionCache.set(key, session);
   console.log(`[SessionStore] Created session ${id.slice(0, 12)}... for ${platform}/${channelId}`);
   return session;
 }
 
 /**
- * Create a background session
+ * Create a background session (isolated from parent)
  */
 export function createBackgroundSession(
-  platform: Platform,
+  platform: string,
   channelId: string,
   userId: string,
   parentSessionId?: string
-): Session {
+): SessionConfig {
   const database = initSessionStore();
+  
   const id = generateSessionId();
   const now = Date.now();
 
-  const session: Session = {
+  const session: SessionConfig = {
     id,
     platform,
     channelId,
@@ -189,13 +194,24 @@ export function createBackgroundSession(
     createdAt: now,
     isBackground: true,
     parentSessionId,
-    messages: [],
   };
 
   database.run(`
     INSERT INTO sessions (id, platform, channel_id, user_id, reset_policy, daily_hour, idle_minutes, last_activity, created_at, is_background, parent_session_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-  `, [id, platform, channelId, userId, session.resetPolicy, session.dailyHour, session.idleMinutes, now, now, parentSessionId ?? null]);
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `, [
+    session.id,
+    session.platform,
+    session.channelId,
+    session.userId,
+    session.resetPolicy,
+    session.dailyHour,
+    session.idleMinutes,
+    session.lastActivity,
+    session.createdAt,
+    1, // is_background
+    session.parentSessionId ?? null,
+  ]);
 
   console.log(`[SessionStore] Created background session ${id.slice(0, 12)}...`);
   return session;
@@ -204,76 +220,29 @@ export function createBackgroundSession(
 /**
  * Check if session should be reset
  */
-function shouldResetSession(session: Session | any): boolean {
+function shouldResetSession(row: SessionRow): boolean {
   const now = Date.now();
   
   // Check idle timeout
-  const idleMs = (session.idleMinutes || 1440) * 60 * 1000;
-  if (now - (session.lastActivity || session.last_activity) > idleMs) {
-    console.log(`[SessionStore] Session reset: idle timeout`);
+  const idleMs = row.idle_minutes * 60 * 1000;
+  if (now - row.last_activity > idleMs) {
+    console.log(`[SessionStore] Session ${row.id.slice(0, 8)} reset: idle timeout`);
     return true;
   }
 
   // Check daily reset
-  const policy = session.resetPolicy || session.reset_policy;
-  if (policy === "daily" || policy === "both") {
-    const lastActivity = new Date(session.lastActivity || session.last_activity);
+  if (row.reset_policy === "daily" || row.reset_policy === "both") {
+    const lastActivity = new Date(row.last_activity);
     const nowDate = new Date(now);
-    const hour = session.dailyHour || session.daily_hour || 4;
     
-    if (lastActivity.getHours() < hour && nowDate.getHours() >= hour && lastActivity.getDate() !== nowDate.getDate()) {
-      console.log(`[SessionStore] Session reset: daily at ${hour}:00`);
+    // Check if we crossed the daily reset hour since last activity
+    if (lastActivity.getHours() < row.daily_hour && nowDate.getHours() >= row.daily_hour) {
+      console.log(`[SessionStore] Session ${row.id.slice(0, 8)} reset: daily at ${row.daily_hour}:00`);
       return true;
     }
   }
 
   return false;
-}
-
-/**
- * Load messages for a session
- */
-function loadMessages(sessionId: string): ChatMessage[] {
-  const database = initSessionStore();
-  const rows = database.query(`
-    SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp ASC
-  `).all(sessionId) as any[];
-
-  return rows.map(row => ({
-    id: row.id,
-    role: row.role as "user" | "assistant" | "system",
-    content: row.content,
-    timestamp: row.timestamp,
-  }));
-}
-
-/**
- * Add message to session
- */
-export function addMessage(sessionId: string, role: "user" | "assistant" | "system", content: string): ChatMessage {
-  const database = initSessionStore();
-  const id = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-  const timestamp = Date.now();
-
-  database.run(`
-    INSERT INTO messages (id, session_id, role, content, timestamp)
-    VALUES (?, ?, ?, ?, ?)
-  `, [id, sessionId, role, content, timestamp]);
-
-  // Update session last activity
-  touchSession(sessionId);
-
-  const message: ChatMessage = { id, role, content, timestamp };
-
-  // Update in-memory cache
-  for (const session of sessionCache.values()) {
-    if (session.id === sessionId) {
-      session.messages.push(message);
-      break;
-    }
-  }
-
-  return message;
 }
 
 /**
@@ -287,26 +256,10 @@ export function touchSession(sessionId: string): void {
 /**
  * Get session by ID
  */
-export function getSession(sessionId: string): Session | null {
-  for (const session of sessionCache.values()) {
-    if (session.id === sessionId) return session;
-  }
-
+export function getSession(sessionId: string): SessionConfig | null {
   const database = initSessionStore();
-  const row = database.query("SELECT * FROM sessions WHERE id = ?").get(sessionId) as any;
-  if (!row) return null;
-
-  const session = rowToSession(row);
-  session.messages = loadMessages(session.id);
-  return session;
-}
-
-/**
- * Get session by platform channel
- */
-export function getSessionByChannel(platform: Platform, channelId: string): Session | null {
-  const key = getSessionKey(platform, channelId);
-  return sessionCache.get(key) || null;
+  const row = database.query("SELECT * FROM sessions WHERE id = ?").get(sessionId) as SessionRow | undefined;
+  return row ? rowToSession(row) : null;
 }
 
 /**
@@ -314,59 +267,55 @@ export function getSessionByChannel(platform: Platform, channelId: string): Sess
  */
 export function deleteSession(sessionId: string): void {
   const database = initSessionStore();
-  database.run("DELETE FROM messages WHERE session_id = ?", [sessionId]);
   database.run("DELETE FROM sessions WHERE id = ?", [sessionId]);
-
-  // Remove from cache
-  for (const [key, session] of sessionCache) {
-    if (session.id === sessionId) {
-      sessionCache.delete(key);
-      break;
-    }
-  }
 }
 
 /**
- * List sessions
+ * List sessions by platform
  */
-export function listSessions(platform?: Platform): Session[] {
+export function listSessions(platform?: string): SessionConfig[] {
   const database = initSessionStore();
-  
   const query = platform 
     ? "SELECT * FROM sessions WHERE platform = ? AND is_background = 0 ORDER BY last_activity DESC"
     : "SELECT * FROM sessions WHERE is_background = 0 ORDER BY last_activity DESC";
   
   const rows = platform 
-    ? database.query(query).all(platform) as any[]
-    : database.query(query).all() as any[];
+    ? database.query(query).all(platform) as SessionRow[]
+    : database.query(query).all() as SessionRow[];
   
-  return rows.map(row => {
-    const session = rowToSession(row);
-    session.messages = loadMessages(session.id);
-    return session;
-  });
+  return rows.map(rowToSession);
 }
 
 /**
- * Set session title
+ * Clean up stale sessions
  */
-export function setSessionTitle(sessionId: string, title: string): void {
+export function cleanupStaleSessions(): number {
   const database = initSessionStore();
-  database.run("UPDATE sessions SET title = ? WHERE id = ?", [title, sessionId]);
-
-  for (const session of sessionCache.values()) {
-    if (session.id === sessionId) {
-      session.title = title;
-      break;
-    }
-  }
+  const cutoff = Date.now() - (7 * 24 * 60 * 60 * 1000); // 7 days
+  const result = database.run("DELETE FROM sessions WHERE last_activity < ?", [cutoff]);
+  return result.changes;
 }
 
-// Helper to convert DB row to Session
-function rowToSession(row: any): Session {
+/**
+ * Get background sessions for delivery
+ */
+export function getPendingBackgroundResults(): SessionConfig[] {
+  const database = initSessionStore();
+  // Background sessions that exist but parent still needs delivery
+  const rows = database.query(`
+    SELECT s.* FROM sessions s
+    WHERE s.is_background = 1
+    ORDER BY s.created_at ASC
+  `).all() as SessionRow[];
+  
+  return rows.map(rowToSession);
+}
+
+// Helper to convert DB row to SessionConfig
+function rowToSession(row: SessionRow): SessionConfig {
   return {
     id: row.id,
-    platform: row.platform as Platform,
+    platform: row.platform,
     channelId: row.channel_id,
     userId: row.user_id,
     resetPolicy: row.reset_policy as ResetPolicy,
@@ -376,50 +325,5 @@ function rowToSession(row: any): Session {
     createdAt: row.created_at,
     isBackground: row.is_background === 1,
     parentSessionId: row.parent_session_id ?? undefined,
-    title: row.title ?? undefined,
-    messages: [],
   };
-}
-
-/**
- * Get session count
- */
-export function getSessionCount(): number {
-  return sessionCache.size;
-}
-
-/**
- * Get session stats
- */
-export function getSessionStats(): { total: number; byPlatform: Record<string, number> } {
-  const byPlatform: Record<string, number> = {};
-  let total = 0;
-
-  for (const session of sessionCache.values()) {
-    if (!session.isBackground) {
-      total++;
-      byPlatform[session.platform] = (byPlatform[session.platform] || 0) + 1;
-    }
-  }
-
-  return { total, byPlatform };
-}
-
-/**
- * Clean up stale sessions
- */
-export function cleanupStaleSessions(maxAgeMs: number = 7 * 24 * 60 * 60 * 1000): number {
-  const database = initSessionStore();
-  const cutoff = Date.now() - maxAgeMs;
-  const result = database.run(`
-    DELETE FROM messages WHERE session_id IN (
-      SELECT id FROM sessions WHERE last_activity < ? AND is_background = 0
-    )
-  `, [cutoff]);
-  const result2 = database.run("DELETE FROM sessions WHERE last_activity < ? AND is_background = 0", [cutoff]);
-  
-  // Clear cache
-  sessionCache.clear();
-  
-  return result2.changes;
 }

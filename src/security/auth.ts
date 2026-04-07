@@ -1,35 +1,47 @@
 /**
  * Security Layer - Hermes-style allowlists and DM pairing
+ * 
+ * Features:
+ * - Per-platform user allowlists
+ * - DM pairing flow with one-time codes
+ * - Rate limiting
+ * - Token authentication for gateway access
  */
 
 import { Database } from "bun:sqlite";
 import { join } from "path";
 import { homedir } from "os";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
-import { randomBytes } from "node:crypto";
-import type { Platform, AllowlistEntry, PairingCode } from "../types.js";
+import { existsSync, mkdirSync, readFileSync } from "fs";
+import { randomBytes, createHmac, timingSafeEqual } from "node:crypto";
 
-const KOBOLD_DIR = join(homedir(), ".0xkobold");
-const GATEWAY_DIR = join(KOBOLD_DIR, "gateway");
-const SECURITY_DB = join(GATEWAY_DIR, "security.db");
-const CONFIG_FILE = join(GATEWAY_DIR, "security.json");
+export type Platform = "discord" | "telegram" | "slack" | "whatsapp" | "signal" | "sms" | "email" | "matrix" | "web" | "websocket";
 
-let db: Database | null = null;
-
-interface SecurityConfig {
-  allowAll: boolean;
-  requirePairing: boolean;
-  rateLimit: {
-    maxRequests: number;
-    windowMs: number;
-  };
+interface AllowlistEntry {
+  platform: Platform;
+  userId: string;
+  addedAt: number;
+  note?: string;
 }
 
-const defaultConfig: SecurityConfig = {
-  allowAll: true,
-  requirePairing: false,
-  rateLimit: { maxRequests: 60, windowMs: 60000 },
-};
+interface PairingCode {
+  code: string;
+  platform: Platform;
+  userId: string;
+  createdAt: number;
+  expiresAt: number;
+  used: boolean;
+}
+
+interface RateLimitEntry {
+  identifier: string;
+  count: number;
+  windowStart: number;
+}
+
+const KOBOLD_DIR = join(homedir(), ".0xkobold");
+const SECURITY_DB = join(KOBOLD_DIR, "gateway-security.db");
+
+let db: Database | null = null;
 
 /**
  * Initialize security database
@@ -37,8 +49,8 @@ const defaultConfig: SecurityConfig = {
 export function initSecurityStore(): Database {
   if (db) return db;
 
-  if (!existsSync(GATEWAY_DIR)) {
-    mkdirSync(GATEWAY_DIR, { recursive: true });
+  if (!existsSync(KOBOLD_DIR)) {
+    mkdirSync(KOBOLD_DIR, { recursive: true });
   }
 
   db = new Database(SECURITY_DB);
@@ -51,10 +63,10 @@ export function initSecurityStore(): Database {
       platform TEXT NOT NULL,
       user_id TEXT NOT NULL,
       added_at INTEGER NOT NULL,
-      note TEXT,
-      UNIQUE(platform, user_id)
+      note TEXT
     )
   `);
+  db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_allowlist ON allowlist(platform, user_id)`);
 
   // Pairing codes table
   db.run(`
@@ -67,6 +79,7 @@ export function initSecurityStore(): Database {
       used INTEGER NOT NULL DEFAULT 0
     )
   `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_pairing_expires ON pairing_codes(expires_at)`);
 
   // Rate limiting table
   db.run(`
@@ -82,93 +95,12 @@ export function initSecurityStore(): Database {
 }
 
 /**
- * Load security config
- */
-export function loadSecurityConfig(): SecurityConfig {
-  try {
-    if (existsSync(CONFIG_FILE)) {
-      return { ...defaultConfig, ...JSON.parse(readFileSync(CONFIG_FILE, "utf-8")) };
-    }
-  } catch { /* ignore */ }
-  return { ...defaultConfig };
-}
-
-/**
- * Save security config
- */
-export function saveSecurityConfig(config: Partial<SecurityConfig>): void {
-  const current = loadSecurityConfig();
-  const updated = { ...current, ...config };
-  writeFileSync(CONFIG_FILE, JSON.stringify(updated, null, 2));
-}
-
-/**
- * Check if user is allowed
- */
-export function isUserAllowed(platform: Platform, userId: string): boolean {
-  const config = loadSecurityConfig();
-  if (config.allowAll) return true;
-
-  const database = initSecurityStore();
-  const entry = database.query(`
-    SELECT 1 FROM allowlist WHERE platform = ? AND user_id = ?
-  `).get(platform, userId);
-
-  return !!entry;
-}
-
-/**
- * Add user to allowlist
- */
-export function addToAllowlist(platform: Platform, userId: string, note?: string): void {
-  const database = initSecurityStore();
-  database.run(`
-    INSERT OR REPLACE INTO allowlist (platform, user_id, added_at, note)
-    VALUES (?, ?, ?, ?)
-  `, [platform, userId, Date.now(), note ?? null]);
-}
-
-/**
- * Remove user from allowlist
- */
-export function removeFromAllowlist(platform: Platform, userId: string): boolean {
-  const database = initSecurityStore();
-  const result = database.run(
-    "DELETE FROM allowlist WHERE platform = ? AND user_id = ?",
-    [platform, userId]
-  );
-  return result.changes > 0;
-}
-
-/**
- * List allowlisted users
- */
-export function listAllowlistedUsers(platform?: Platform): AllowlistEntry[] {
-  const database = initSecurityStore();
-  
-  const query = platform 
-    ? "SELECT * FROM allowlist WHERE platform = ? ORDER BY added_at DESC"
-    : "SELECT * FROM allowlist ORDER BY platform, added_at DESC";
-  
-  const rows = platform 
-    ? database.query(query).all(platform) as any[]
-    : database.query(query).all() as any[];
-  
-  return rows.map(row => ({
-    platform: row.platform as Platform,
-    userId: row.user_id,
-    addedAt: row.added_at,
-    note: row.note ?? undefined,
-  }));
-}
-
-/**
  * Generate pairing code
  */
 export function generatePairingCode(platform: Platform, userId: string): string {
   const database = initSecurityStore();
   
-  // Generate 8-character code
+  // Generate 8-character alphanumeric code
   const code = randomBytes(6).toString("base64url").slice(0, 8).toUpperCase();
   const now = Date.now();
   const expiresAt = now + (60 * 60 * 1000); // 1 hour
@@ -190,7 +122,7 @@ export function approvePairingCode(code: string): boolean {
   
   const entry = database.query(`
     SELECT * FROM pairing_codes WHERE code = ? AND used = 0 AND expires_at > ?
-  `).get(code, Date.now()) as any;
+  `).get(code, Date.now()) as PairingCode | undefined;
 
   if (!entry) {
     console.log(`[Security] Pairing code ${code} not found or expired`);
@@ -198,53 +130,110 @@ export function approvePairingCode(code: string): boolean {
   }
 
   // Add to allowlist
-  addToAllowlist(entry.platform, entry.user_id);
+  database.run(`
+    INSERT OR IGNORE INTO allowlist (platform, user_id, added_at)
+    VALUES (?, ?, ?)
+  `, [entry.platform, entry.userId, Date.now()]);
 
   // Mark code as used
   database.run("UPDATE pairing_codes SET used = 1 WHERE code = ?", [code]);
 
-  console.log(`[Security] Approved pairing: ${entry.platform}/${entry.user_id}`);
+  console.log(`[Security] Approved pairing: ${entry.platform}/${entry.userId}`);
   return true;
 }
 
 /**
  * List pending pairing codes
  */
-export function listPendingPairingCodes(): PairingCode[] {
+export function listPendingPairingCodes(): Array<{code: string; platform: Platform; userId: string; createdAt: number; expiresIn: number}> {
   const database = initSecurityStore();
   const now = Date.now();
   
   const rows = database.query(`
     SELECT * FROM pairing_codes WHERE used = 0 AND expires_at > ?
     ORDER BY created_at ASC
-  `).all(now) as any[];
+  `).all(now) as PairingCode[];
 
   return rows.map(row => ({
     code: row.code,
-    platform: row.platform as Platform,
-    userId: row.user_id,
-    createdAt: row.created_at,
-    expiresAt: row.expires_at,
-    used: row.used === 1,
+    platform: row.platform,
+    userId: row.userId,
+    createdAt: row.createdAt,
+    expiresIn: Math.max(0, row.expiresAt - now),
   }));
 }
 
 /**
- * Check rate limit
+ * Revoke user access
  */
-export function checkRateLimit(identifier: string, maxRequests?: number, windowMs?: number): boolean {
-  const config = loadSecurityConfig();
-  const max = maxRequests ?? config.rateLimit.maxRequests;
-  const window = windowMs ?? config.rateLimit.windowMs;
+export function revokeUserAccess(platform: Platform, userId: string): boolean {
+  const database = initSecurityStore();
+  const result = database.run(
+    "DELETE FROM allowlist WHERE platform = ? AND user_id = ?",
+    [platform, userId]
+  );
+  return result.changes > 0;
+}
+
+/**
+ * Check if user is allowed
+ */
+export function isUserAllowed(platform: Platform, userId: string): boolean {
+  const database = initSecurityStore();
   
+  // Check global allow all first
+  const config = getSecurityConfig();
+  if (config.allowAll) return true;
+
+  // Check specific allowlist
+  const entry = database.query(`
+    SELECT 1 FROM allowlist WHERE platform = ? AND user_id = ?
+  `).get(platform, userId);
+
+  return !!entry;
+}
+
+/**
+ * Add user to allowlist
+ */
+export function addToAllowlist(platform: Platform, userId: string, note?: string): void {
+  const database = initSecurityStore();
+  database.run(`
+    INSERT OR REPLACE INTO allowlist (platform, user_id, added_at, note)
+    VALUES (?, ?, ?, ?)
+  `, [platform, userId, Date.now(), note ?? null]);
+}
+
+/**
+ * List allowlisted users
+ */
+export function listAllowlistedUsers(platform?: Platform): AllowlistEntry[] {
+  const database = initSecurityStore();
+  
+  const query = platform 
+    ? "SELECT * FROM allowlist WHERE platform = ? ORDER BY added_at DESC"
+    : "SELECT * FROM allowlist ORDER BY platform, added_at DESC";
+  
+  const rows = platform 
+    ? database.query(query).all(platform) as AllowlistEntry[]
+    : database.query(query).all() as AllowlistEntry[];
+  
+  return rows;
+}
+
+/**
+ * Rate limiting
+ */
+export function checkRateLimit(identifier: string, maxRequests: number = 60, windowMs: number = 60000): boolean {
   const database = initSecurityStore();
   const now = Date.now();
   
   const entry = database.query(`
     SELECT * FROM rate_limits WHERE identifier = ?
-  `).get(identifier) as any;
+  `).get(identifier) as RateLimitEntry | undefined;
 
-  if (!entry || now - entry.window_start > window) {
+  if (!entry || now - entry.windowStart > windowMs) {
+    // New window
     database.run(`
       INSERT OR REPLACE INTO rate_limits (identifier, count, window_start)
       VALUES (?, 1, ?)
@@ -252,12 +241,16 @@ export function checkRateLimit(identifier: string, maxRequests?: number, windowM
     return true;
   }
 
-  if (entry.count >= max) {
+  if (entry.count >= maxRequests) {
     console.log(`[Security] Rate limit exceeded for ${identifier}`);
     return false;
   }
 
-  database.run(`UPDATE rate_limits SET count = count + 1 WHERE identifier = ?`, [identifier]);
+  // Increment counter
+  database.run(`
+    UPDATE rate_limits SET count = count + 1 WHERE identifier = ?
+  `, [identifier]);
+  
   return true;
 }
 
@@ -268,4 +261,38 @@ export function cleanupExpiredCodes(): number {
   const database = initSecurityStore();
   const result = database.run("DELETE FROM pairing_codes WHERE expires_at < ?", [Date.now()]);
   return result.changes;
+}
+
+// Security configuration
+interface SecurityConfig {
+  allowAll: boolean;
+  requirePairing: boolean;
+  rateLimit: {
+    maxRequests: number;
+    windowMs: number;
+  };
+}
+
+const CONFIG_FILE = join(KOBOLD_DIR, "gateway-security.json");
+
+function getSecurityConfig(): SecurityConfig {
+  try {
+    if (existsSync(CONFIG_FILE)) {
+      const content = readFileSync(CONFIG_FILE, "utf-8");
+      return JSON.parse(content);
+    }
+  } catch {
+    // Ignore
+  }
+  return {
+    allowAll: false,
+    requirePairing: false,
+    rateLimit: { maxRequests: 60, windowMs: 60000 },
+  };
+}
+
+export function setSecurityConfig(config: Partial<SecurityConfig>): void {
+  const current = getSecurityConfig();
+  const updated = { ...current, ...config };
+  Bun.write(CONFIG_FILE, JSON.stringify(updated, null, 2));
 }

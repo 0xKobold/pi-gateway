@@ -1,38 +1,53 @@
 {
   "name": "@0xkobold/pi-gateway",
-  "version": "0.2.0",
-  "description": "Hermes-style messaging gateway for pi-coding-agent",
-  "keywords": ["pi-package", "gateway", "messaging", "hermes"],
+  "version": "0.3.0",
+  "description": "Hermes-style messaging gateway for pi - multi-platform agent with sessions, security, and background tasks",
+  "author": "0xKobold",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi-extension", "gateway", "messaging", "hermes", "multi-platform"],
   "type": "module",
-  "main": "./dist/index.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "exports": {
-    ".": { "import": "./dist/index.ts" },
-    "./sessions": { "import": "./dist/sessions/store.ts" },
-    "./security": { "import": "./dist/security/auth.ts" },
-    "./adapters": { "import": "./dist/adapters/discord.ts" }
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
   },
+  "files": [
+    "dist/",
+    "src/",
+    "README.md"
+  ],
   "scripts": {
-    "build": "echo 'Using bun' && exit 0",
-    "test": "bun test"
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "npx tsx tests/index.ts",
+    "demo": "npx tsx tests/demo-server.ts",
+    "client": "npx tsx tests/client-demo.ts",
+    "prepublishOnly": "rm -rf dist && tsc"
   },
   "dependencies": {
-    "ws": "^8.18.0",
-    "zod": "^3.25.0"
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "@types/node": "^20.19.37",
     "@types/ws": "^8.18.1",
-    "@types/bun": "^1.2.0",
-    "bun-types": "^1.2.0"
+    "bun-types": "^1.3.11",
+    "tsx": "^4.19.0",
+    "typescript": "^6.0.2"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@sinclair/typebox": "*"
+    "@mariozechner/pi-coding-agent": ">=0.65.0",
+    "@sinclair/typebox": ">=0.32.0"
   },
   "pi": {
-    "extensions": ["./dist/index.ts"]
+    "extensions": [
+      "./dist/index.js"
+    ]
   },
-  "repository": { "type": "git", "url": "https://github.com/0xKobold/pi-gateway.git" },
-  "author": "0xKobold",
-  "license": "MIT"
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/0xKobold/pi-gateway.git"
+  }
 }

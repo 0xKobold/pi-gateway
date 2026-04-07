@@ -1,11 +1,1 @@
-export { 
-  initSessionStore, 
-  getOrCreateSession, 
-  listSessions, 
-  addMessage, 
-  getSession,
-  getSessionStats,
-  generateSessionId,
-  setSessionTitle,
-  deleteSession
-} from "./store.js";
+export { initSessionStore, getOrCreateSession, listSessions, touchSession, getSession, deleteSession, type SessionConfig, type ResetPolicy } from "./store.js";

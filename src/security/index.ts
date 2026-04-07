@@ -1,14 +1,1 @@
-export {
-  initSecurityStore,
-  isUserAllowed,
-  addToAllowlist,
-  removeFromAllowlist,
-  listAllowlistedUsers,
-  generatePairingCode,
-  approvePairingCode,
-  listPendingPairingCodes,
-  loadSecurityConfig,
-  saveSecurityConfig,
-  checkRateLimit,
-  cleanupExpiredCodes,
-} from "./auth.js";
+export { initSecurityStore, isUserAllowed, approvePairingCode, generatePairingCode, listPendingPairingCodes, addToAllowlist, listAllowlistedUsers, revokeUserAccess, checkRateLimit, type Platform } from "./auth.js";
